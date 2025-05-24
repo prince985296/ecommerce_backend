@@ -3,10 +3,10 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import { sequelize, initializeDatabase, checkConnectionHealth } from './config/db.js';
+import { sequelize } from './config/db.js';
 
 // Route imports
-import userRoutes from './routes/createUserrouter.js';
+import userRoutes from './routes/createUserrouter.js'; // Combined user routes
 import addressRoutes from './routes/addressRoutes.js';
 import getAddressRoutes from './routes/getAddressroute.js';
 import apiRoutes from './routes/api_routers.js';
@@ -15,235 +15,166 @@ import adminDashbord from './routes/adminDashbord.js';
 import adminloginRoute from './routes/adminLoginRoute.js';
 import feedbackRoutes from './routes/feedbackRoutes.js';
 
+
 // Initialize environment variables
 dotenv.config();
 
+// Create Express app
 const app = express();
-const allowedOrigins = [
-  'https://desitasty.com', 
-  'https://staging.desitasty.com',
-  process.env.LOCAL_ORIGIN // Add this to your Railway env vars if needed
-];
+const allowedOrigins = ['https://desitasty.com', 'https://staging.desitasty.com'];
 
-// ------------------ Enhanced Middleware ------------------ //
 
-// Security middleware with additional CSP configuration
-app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", "data:"],
-      connectSrc: ["'self'", ...allowedOrigins]
-    }
-  },
-  crossOriginResourcePolicy: { policy: "same-site" }
-}));
+// ------------------ Middleware ------------------ //
 
-// Body parsing middleware with stricter limits
-app.use(express.json({ 
-  limit: '10kb',
-  strict: true 
-}));
-app.use(express.urlencoded({ 
-  extended: true, 
-  limit: '10kb',
-  parameterLimit: 10 
-}));
+// Security middleware
+app.use(helmet());
 
-// Enhanced CORS configuration
-const corsOptions = {
+
+// Body parsing middleware
+app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// CORS middleware
+app.use(cors({
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
-    if (!origin) return callback(null, true);
-    
-    if (allowedOrigins.includes(origin)) {
+    if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
-      console.warn(`Blocked by CORS: ${origin}`);
       callback(new Error('Not allowed by CORS'));
     }
   },
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-  credentials: true,
-  maxAge: 86400, // 24 hours
-  preflightContinue: false
-};
+  //origin:'*', // Use environment variable for CORS origin
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
+}));
 
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // Enable preflight for all routes
+app.set('trust proxy', true);
 
-// Trust proxy settings for Railway
-app.set('trust proxy', 1); // Trust first proxy
-
-// Rate limiting with Redis storage (recommended for production)
-const limiter = rateLimit({
+// Rate limiting - different limits for different routes
+const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: process.env.NODE_ENV === 'production' ? 100 : 1000, // Different limits for prod/dev
-  standardHeaders: true,
-  legacyHeaders: false,
-  skip: (req) => req.ip === '::ffff:127.0.0.1', // Skip for localhost
-  handler: (req, res) => {
-    res.status(429).json({
-      error: 'Too many requests',
-      retryAfter: '15 minutes'
+  max: 100,
+  message: 'Too many requests from this IP, please try again later'
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: 'Too many auth requests from this IP, please try again later'
+});
+
+// ------------------ Routes ------------------ //
+// Apply rate limiting to appropriate routes
+app.use('/api/auth', authLimiter);
+app.use('/api', apiLimiter);
+
+// User routes
+app.use('/api/auth', userRoutes); // Assuming this combines getOrCreateUser and getAllUser
+
+// Address routes
+app.use('/api/address', addressRoutes);
+app.use('/api/get-address', getAddressRoutes);
+
+// Order routes
+app.use('/api/get-orders', orderRoutes);
+
+// Admin routes
+app.use('/admin/login', adminloginRoute);
+app.use('/admin/dashboard', adminDashbord);
+
+// Feedback routes
+app.use('/api/feedback', feedbackRoutes);
+
+// General API
+app.use('/api', apiRoutes);
+
+// ------------------ Health Checks ------------------ //
+//app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
+
+app.get('/db-health', async (req, res) => {
+  try {
+    await sequelize.authenticate();
+    const [results] = await sequelize.query('SELECT 1+1 AS result');
+    res.json({ 
+      status: 'healthy',
+      dbResult: results[0].result,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'unhealthy',
+      error: error.message,
+      ...(process.env.NODE_ENV === 'development' && { stack: error.stack })
     });
   }
 });
 
-// ------------------ Route Enhancements ------------------ //
-
-// Apply rate limiting
-app.use(limiter);
-
-// Health checks with database verification
-app.get('/health', async (req, res) => {
-  const dbHealth = await checkConnectionHealth();
-  const status = dbHealth ? 'healthy' : 'degraded';
-  
-  res.status(dbHealth ? 200 : 503).json({
-    status,
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    database: dbHealth ? 'connected' : 'disconnected',
-    memoryUsage: process.memoryUsage().rss / 1024 / 1024 + 'MB'
-  });
-});
-
-// Mount routes
-app.use('/api/auth', userRoutes);
-app.use('/api/address', addressRoutes);
-app.use('/api/get-address', getAddressRoutes);
-app.use('/api/get-orders', orderRoutes);
-app.use('/admin/login', adminloginRoute);
-app.use('/admin/dashboard', adminDashbord);
-app.use('/api/feedback', feedbackRoutes);
-app.use('/api', apiRoutes);
-
-// Enhanced root route
+// Root route
 app.get('/', (req, res) => {
   res.json({
-    message: 'DesiTasty API Service',
-    version: process.env.npm_package_version || '1.0.0',
+    message: 'API is running',
     environment: process.env.NODE_ENV || 'development',
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-    docs: 'https://docs.desitasty.com' // Add your API docs link
+    timestamp: new Date().toISOString()
   });
 });
 
-// ------------------ Error Handling Improvements ------------------ //
-
-// 404 Handler with more details
-app.use((req, res, next) => {
+// 404 Handler
+app.use((req, res) => {
   res.status(404).json({
-    error: 'Endpoint not found',
+    error: 'Not found',
     path: req.path,
-    method: req.method,
-    availableEndpoints: {
-      auth: '/api/auth',
-      orders: '/api/get-orders',
-      admin: '/admin'
-    }
+    method: req.method
   });
 });
 
-// Production error handler
-const errorHandler = (err, req, res, next) => {
-  const statusCode = err.statusCode || 500;
-  const isProduction = process.env.NODE_ENV === 'production';
-  
-  // Log detailed error for server-side
-  console.error(`[${new Date().toISOString()}] ${statusCode} ${req.method} ${req.path}`, {
-    error: err.message,
-    stack: err.stack,
-    body: req.body,
-    params: req.params,
-    query: req.query
-  });
+// Error Handling Middleware
+app.use((err, req, res, next) => {
+  console.error(`[${new Date().toISOString()}] Error:`, err.stack);
 
-  // Client response
+  const statusCode = err.statusCode || 500;
+  const message = process.env.NODE_ENV === 'production' 
+    ? 'An error occurred' 
+    : err.message;
+
   res.status(statusCode).json({
-    error: isProduction && statusCode === 500 ? 'Internal server error' : err.message,
-    ...(!isProduction && { 
+    error: message,
+    ...(process.env.NODE_ENV === 'development' && { 
       stack: err.stack,
-      details: err.details 
+      details: err 
     })
   });
-};
+});
 
-app.use(errorHandler);
-
-// ------------------ Server Startup with Graceful Shutdown ------------------ //
-
+// ------------------ Server Startup ------------------ //
 const startServer = async () => {
   try {
-    // Initialize database with retry logic
-    let retries = 5;
-    while (retries > 0) {
-      try {
-        await initializeDatabase();
-        break;
-      } catch (dbError) {
-        retries--;
-        console.error(`Database connection failed. Retries left: ${retries}`, dbError);
-        if (retries === 0) throw dbError;
-        await new Promise(res => setTimeout(res, 5000)); // Wait 5 seconds before retry
-      }
-    }
+    await sequelize.authenticate();
+    console.log('✅ Database connected');
 
+
+    
     const PORT = process.env.PORT || 5000;
     const server = app.listen(PORT, () => {
       console.log(`🚀 Server running in ${process.env.NODE_ENV || 'development'} mode on port ${PORT}`);
-      console.log(`📚 API docs available at /api-docs`);
-      console.log(`🩺 Health check at /health`);
     });
 
-    // Graceful shutdown handlers
-    const shutdown = async (signal) => {
-      console.log(`Received ${signal}. Shutting down gracefully...`);
-      
-      // Close server first to stop accepting new connections
-      server.close(async () => {
-        console.log('HTTP server closed');
-        
-        // Then close database connections
-        try {
-          await sequelize.close();
-          console.log('Database connections closed');
-        } catch (dbError) {
-          console.error('Error closing database connections:', dbError);
-        }
-        
+    process.on('SIGTERM', () => {
+      console.log('SIGTERM received. Shutting down gracefully...');
+      server.close(() => {
+        console.log('Server closed');
         process.exit(0);
       });
-
-      // Force shutdown after 10 seconds if graceful shutdown fails
-      setTimeout(() => {
-        console.error('Forcing shutdown due to timeout');
-        process.exit(1);
-      }, 10000);
-    };
-
-    process.on('SIGTERM', () => shutdown('SIGTERM'));
-    process.on('SIGINT', () => shutdown('SIGINT'));
-    process.on('uncaughtException', (err) => {
-      console.error('Uncaught Exception:', err);
-      shutdown('uncaughtException');
     });
-    process.on('unhandledRejection', (reason, promise) => {
-      console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-      shutdown('unhandledRejection');
-    });
-
   } catch (error) {
     console.error('❌ Failed to start server:', error);
     process.exit(1);
   }
 };
 
+
 startServer();
 
 export default app;
+
+this is index.js its correct
